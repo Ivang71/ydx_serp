@@ -246,6 +246,9 @@ function startServer(port: number) {
         const result = await orchestrateSearch(q)
         console.log('request_respond', { items: (result as any[])?.length })
         stats.success++
+        if (process.env.DEBUG) {
+          try { await fs.promises.writeFile(process.env.LAST_FILE || 'last.json', JSON.stringify(result, null, '\t')) } catch (e) { console.error('last_write_error', (e as any)?.message || e) }
+        }
         res.statusCode = 200
         res.setHeader('Content-Type', 'application/json')
         res.end(JSON.stringify(result))
