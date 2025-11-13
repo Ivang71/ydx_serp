@@ -64,16 +64,10 @@ class TaskQueue<T> {
 }
 
 async function searchOnce(browser: any, locale: string, acceptLanguage: string, query: string, timeoutMs: number, signal?: AbortSignal): Promise<SearchItem[]> {
+  console.log('searchOnce____________________', { locale, acceptLanguage, query, timeoutMs })
   const context = await browser.newContext({ ignoreHTTPSErrors: true, locale, extraHTTPHeaders: { 'Accept-Language': acceptLanguage } })
   try {
-    await context.route('**/*', (route: any) => {
-      const req = route.request()
-      const url = req.url()
-      const type = req.resourceType()
-      if (type === 'image' || type === 'font') return route.abort()
-      if (/\.(?:jpe?g|png|webp|avif|woff2?|ttf|otf)(?:[?#]|$)/i.test(url)) return route.abort()
-      return route.continue()
-    })
+    // No request filtering; allow all network requests
     await context.addInitScript(() => {
       delete (window as any).navigator.webdriver
       delete (window as any).navigator.__proto__?.webdriver
@@ -106,7 +100,24 @@ async function searchOnce(browser: any, locale: string, acceptLanguage: string, 
       page.waitForSelector('h2#RelatedBottom', { timeout: timeoutMs }),
       abortPromise
     ])
-    await context.route('**/*', (r: any) => r.abort())
+    // If AI teaser block exists, wait for FuturisMarkdown to mount inside it
+    try {
+      const selector = '#search-result > li[data-fast-subtype="teaser_gen_answer"]'
+      const cardSelector = `${selector} .FuturisMarkdown`
+      const AI_TIMEOUT_MS = 40_000
+      const hasAiTeaser = await page.$(selector)
+      console.log('ai_teaser_present', { present: !!hasAiTeaser })
+      if (hasAiTeaser) {
+        await Promise.race([
+          page.waitForSelector(cardSelector, { timeout: AI_TIMEOUT_MS }),
+          abortPromise
+        ])
+        console.log('ai_teaser_card_ready')
+      }
+    } catch (e) {
+      console.error('ai_teaser_error', { error: (e as any)?.message || e })
+    }
+    // Do not abort all network requests; allow further fetches so AI card can load
     const items = await page.evaluate(() => {
       const out: { text: string; links: string[] }[] = []
       const seen = new Set<string>()
@@ -115,15 +126,26 @@ async function searchOnce(browser: any, locale: string, acceptLanguage: string, 
         clone.querySelectorAll('[class]').forEach(node => {
           if (/subtitle/i.test(node.getAttribute('class') || '')) node.remove()
         })
+        const fast = (li.getAttribute('data-fast-name') || '').trim()
+        const isFuturis = ((li.getAttribute('class') || '').toLowerCase().includes('futuris'))
+        const anchors = Array.from(li.querySelectorAll('a[href]')) as HTMLAnchorElement[]
+        let links: string[] = []
         let text = (clone.innerText || '')
           .replace(/[\t\r\n]+/g, ' ')
           .replace(/\s{2,}/g, ' ')
           .replace(/([a-zа-яё])([A-ZА-ЯЁ])/g, '$1 $2')
           .trim()
-        const fast = (li.getAttribute('data-fast-name') || '').trim()
-        const isFuturis = ((li.getAttribute('class') || '').toLowerCase().includes('futuris'))
-        const anchors = Array.from(li.querySelectorAll('a[href]')) as HTMLAnchorElement[]
-        let links: string[] = []
+        if (isFuturis) {
+          const md = li.querySelector('.FuturisMarkdown') as HTMLElement | null
+          if (md) {
+            const mdText = (md.innerText || '')
+              .replace(/[\t\r\n]+/g, ' ')
+              .replace(/\s{2,}/g, ' ')
+              .replace(/([a-zа-яё])([A-ZА-ЯЁ])/g, '$1 $2')
+              .trim()
+            if (mdText) text = mdText
+          }
+        }
         if (isFuturis) links = anchors.map(a => a.href)
         else if (fast === 'video-unisearch') links = []
         else if (anchors[0]) links = [anchors[0].href]
@@ -134,16 +156,19 @@ async function searchOnce(browser: any, locale: string, acceptLanguage: string, 
     })
     return items
   } finally {
-    try { await context.close() } catch {}
+    // try { await context.close() } catch {}
   }
 }
 
 class BrowserWorker {
   private browser: any | null = null
-  private country: string
-  private locale: string
-  private acceptLanguage: string
+  private country!: string
+  private locale!: string
+  private acceptLanguage!: string
   constructor(private queue: TaskQueue<TaskPayload>, private id: number) {
+    this.updateRegion()
+  }
+  private updateRegion() {
     this.country = pickRandomCountry()
     this.locale = COUNTRY_TO_LOCALE[this.country]
     const lang = this.locale.split('-')[0]
@@ -156,38 +181,40 @@ class BrowserWorker {
       try {
         if (!this.browser) await this.launch()
         console.log('worker_search_start', { worker: this.id, country: this.country, q: task.value.query })
-        const items = await searchOnce(this.browser, this.locale, this.acceptLanguage, task.value.query, task.value.timeoutMs, task.value.signal)
-        console.log('worker_search_ok', { worker: this.id, items: items.length })
+        const items = await this.performSearch(task.value.query, task.value.timeoutMs, task.value.signal)
         task.resolve(items)
       } catch (err) {
-        if ((err as any)?.message === 'aborted') { task.reject(err); continue }
-        console.error('worker_search_error_relaunch', { worker: this.id })
-        await this.relaunch()
-        try {
-          const items = await searchOnce(this.browser, this.locale, this.acceptLanguage, task.value.query, task.value.timeoutMs, task.value.signal)
-          console.log('worker_search_ok_after_relaunch', { worker: this.id, items: items.length })
-          task.resolve(items)
-        } catch (e) {
-          if ((e as any)?.message === 'aborted') { task.reject(e) }
-          else {
-            console.error('worker_search_error_fail', { worker: this.id, error: (e as any)?.message || e })
-            task.reject(e)
-          }
-        }
+        task.reject(err)
+      }
+    }
+  }
+  private async performSearch(query: string, timeoutMs: number, signal?: AbortSignal): Promise<SearchItem[]> {
+    try {
+      const items = await searchOnce(this.browser, this.locale, this.acceptLanguage, query, timeoutMs, signal)
+      console.log('worker_search_ok', { worker: this.id, items: items.length })
+      return items
+    } catch (err) {
+      if ((err as any)?.message === 'aborted') throw err
+      console.error('worker_search_error_relaunch', { worker: this.id })
+      await this.relaunch()
+      try {
+        const items = await searchOnce(this.browser, this.locale, this.acceptLanguage, query, timeoutMs, signal)
+        console.log('worker_search_ok_after_relaunch', { worker: this.id, items: items.length })
+        return items
+      } catch (e) {
+        if ((e as any)?.message === 'aborted') throw e
+        console.error('worker_search_error_fail', { worker: this.id, error: (e as any)?.message || e })
+        throw e
       }
     }
   }
   private async launch() {
-    const options: Parameters<typeof chromium.launch>[0] = { headless: process.env.HEADLESS !== '0', args: chromeArgs(), proxy: getProxy(this.country) }
+    const options: Parameters<typeof chromium.launch>[0] = { headless: process.env.HEADLESS !== '0', devtools: true, args: chromeArgs(), proxy: getProxy(this.country) }
     console.log('worker_launch', { worker: this.id, country: this.country })
     this.browser = await chromium.launch(options)
   }
   private async relaunch() {
-    try { await this.browser?.close() } catch {}
-    this.country = pickRandomCountry()
-    this.locale = COUNTRY_TO_LOCALE[this.country]
-    const lang = this.locale.split('-')[0]
-    this.acceptLanguage = `${this.locale},${lang};q=0.9`
+    this.updateRegion()
     console.log('worker_relaunch', { worker: this.id, country: this.country })
     await this.launch()
   }
