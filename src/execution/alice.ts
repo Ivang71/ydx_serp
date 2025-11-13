@@ -60,9 +60,47 @@ export async function searchAlice(browser: any, locale: string, acceptLanguage: 
       abortPromise,
       captchaPromise
     ])
-    return []
+    await Promise.race([
+      page.waitForSelector('.AliceInput, input.AliceInput, .AliceInput input, .AliceInput textarea, textarea.AliceInput', { timeout: timeoutMs }).catch(() => null),
+      abortPromise,
+      captchaPromise
+    ])
+    const selector = '.AliceInput input, input.AliceInput, .AliceInput textarea, textarea.AliceInput'
+    try {
+      await page.fill(selector, query, { timeout: Math.max(500, Math.floor(timeoutMs / 2)) })
+    } catch {}
+    try {
+      await page.focus(selector)
+      for (let i = 0; i < 3; i++) {
+        if (signal?.aborted) throw new Error('aborted')
+        await page.press(selector, 'Enter')
+        await page.waitForTimeout(25)
+      }
+    } catch {}
+    await Promise.race([
+      page.waitForFunction(() => {
+        const el = document.querySelector('.StandaloneOknyxCore-Logo') as HTMLElement | null
+        if (!el) return false
+        const inlineDisplay = el.style && el.style.display
+        const computedDisplay = window.getComputedStyle(el).display
+        return (!inlineDisplay || inlineDisplay === '') && computedDisplay !== 'none'
+      }, { timeout: timeoutMs }).catch(() => null),
+      abortPromise,
+      captchaPromise
+    ])
+    await Promise.race([
+      page.waitForSelector('.FuturisMarkdown', { timeout: timeoutMs }).catch(() => null),
+      abortPromise,
+      captchaPromise
+    ])
+    let aiText = ''
+    try {
+      aiText = await page.$eval('.FuturisMarkdown', (el: any) => (el.textContent || '').trim())
+    } catch {}
+    const items: SearchItem[] = [{ text: aiText, links: [] }]
+    return items
   } finally {
-    // try { await context.close() } catch {}
+    try { await context.close() } catch {}
   }
 }
 
