@@ -125,7 +125,7 @@ async function searchOnce(browser: any, locale: string, acceptLanguage: string, 
       const url = req.url()
       const hit = await readCached(method, url)
       if (hit) {
-        debug('cache_hit', { url })
+        // debug('cache_hit', { url })
         return route.fulfill({ status: hit.status, headers: hit.headers, body: method === 'HEAD' ? undefined : hit.body })
       }
       const resp = await route.fetch()
@@ -161,7 +161,7 @@ async function searchOnce(browser: any, locale: string, acceptLanguage: string, 
       captchaPromise
     ])
     await Promise.race([
-      page.waitForSelector('h2#RelatedBottom', { timeout: timeoutMs }),
+      page.waitForSelector('footer', { timeout: timeoutMs }).catch(() => null),
       abortPromise,
       captchaPromise
     ])
@@ -171,6 +171,11 @@ async function searchOnce(browser: any, locale: string, acceptLanguage: string, 
         const selector = '#search-result > li[data-fast-subtype="teaser_gen_answer"]'
         const cardSelector = `${selector} .FuturisMarkdown`
         const AI_TIMEOUT_MS = 40_000
+        const AI_DETECT_MS = 3_000
+        await Promise.race([
+          page.waitForSelector(selector, { timeout: AI_DETECT_MS }),
+          abortPromise
+        ]).catch(() => null)
         const hasAiTeaser = await page.$(selector)
         debug('ai_teaser_present', { present: !!hasAiTeaser })
         if (hasAiTeaser) {
