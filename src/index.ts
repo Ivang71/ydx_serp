@@ -6,6 +6,7 @@ import { URL } from 'url'
 import { getProxy } from './proxy.js'
 import { COUNTRY_TO_LOCALE, pickRandomCountry } from './countries.js'
 import { debug, info, error } from './logger.js'
+import type { Route } from 'playwright'
 
 chromium.use(stealth())
 
@@ -67,7 +68,11 @@ class TaskQueue<T> {
 async function searchOnce(browser: any, locale: string, acceptLanguage: string, query: string, timeoutMs: number, signal: AbortSignal | undefined, getAiAnswer: boolean): Promise<SearchItem[]> {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, locale, extraHTTPHeaders: { 'Accept-Language': acceptLanguage } })
   try {
-    // No request filtering; allow all network requests
+    await context.route(/\.(?:jpg|jpeg|webp|woff|woff2|eot|ttf|otf|ico)(?:[?#]|$)/i, (route: Route) => route.abort())
+    await context.route('**/*', (route: Route) => {
+      if (route.request().resourceType() === 'font') return route.abort()
+      return route.continue()
+    })
     await context.addInitScript(() => {
       delete (window as any).navigator.webdriver
       delete (window as any).navigator.__proto__?.webdriver
