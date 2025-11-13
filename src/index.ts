@@ -5,6 +5,7 @@ import fs from 'fs'
 import { URL } from 'url'
 import { getProxy } from './proxy.js'
 import { COUNTRY_TO_LOCALE, pickRandomCountry } from './countries.js'
+import { debug, info, error } from './logger.js'
 
 chromium.use(stealth())
 
@@ -41,7 +42,7 @@ function chromeArgs(): string[] {
 }
 
 type SearchItem = { text: string; links: string[] }
-type TaskPayload = { query: string; timeoutMs: number; signal?: AbortSignal }
+type TaskPayload = { query: string; timeoutMs: number; getAiAnswer: boolean; signal?: AbortSignal }
 
 class TaskQueue<T> {
   private tasks: { value: T; resolve: (v: any) => void; reject: (e: any) => void }[] = []
@@ -63,8 +64,7 @@ class TaskQueue<T> {
   }
 }
 
-async function searchOnce(browser: any, locale: string, acceptLanguage: string, query: string, timeoutMs: number, signal?: AbortSignal): Promise<SearchItem[]> {
-  console.log('searchOnce____________________', { locale, acceptLanguage, query, timeoutMs })
+async function searchOnce(browser: any, locale: string, acceptLanguage: string, query: string, timeoutMs: number, signal: AbortSignal | undefined, getAiAnswer: boolean): Promise<SearchItem[]> {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, locale, extraHTTPHeaders: { 'Accept-Language': acceptLanguage } })
   try {
     // No request filtering; allow all network requests
@@ -100,22 +100,24 @@ async function searchOnce(browser: any, locale: string, acceptLanguage: string, 
       page.waitForSelector('h2#RelatedBottom', { timeout: timeoutMs }),
       abortPromise
     ])
-    // If AI teaser block exists, wait for FuturisMarkdown to mount inside it
-    try {
-      const selector = '#search-result > li[data-fast-subtype="teaser_gen_answer"]'
-      const cardSelector = `${selector} .FuturisMarkdown`
-      const AI_TIMEOUT_MS = 40_000
-      const hasAiTeaser = await page.$(selector)
-      console.log('ai_teaser_present', { present: !!hasAiTeaser })
-      if (hasAiTeaser) {
-        await Promise.race([
-          page.waitForSelector(cardSelector, { timeout: AI_TIMEOUT_MS }),
-          abortPromise
-        ])
-        console.log('ai_teaser_card_ready')
+    // If requested, wait for Futuris AI answer to mount
+    if (getAiAnswer) {
+      try {
+        const selector = '#search-result > li[data-fast-subtype="teaser_gen_answer"]'
+        const cardSelector = `${selector} .FuturisMarkdown`
+        const AI_TIMEOUT_MS = 40_000
+        const hasAiTeaser = await page.$(selector)
+        debug('ai_teaser_present', { present: !!hasAiTeaser })
+        if (hasAiTeaser) {
+          await Promise.race([
+            page.waitForSelector(cardSelector, { timeout: AI_TIMEOUT_MS }),
+            abortPromise
+          ])
+          debug('ai_teaser_card_ready')
+        }
+      } catch (e) {
+        error('ai_teaser_error', { error: (e as any)?.message || e })
       }
-    } catch (e) {
-      console.error('ai_teaser_error', { error: (e as any)?.message || e })
     }
     // Do not abort all network requests; allow further fetches so AI card can load
     const items = await page.evaluate(() => {
@@ -180,42 +182,42 @@ class BrowserWorker {
       const task = await this.queue.next()
       try {
         if (!this.browser) await this.launch()
-        console.log('worker_search_start', { worker: this.id, country: this.country, q: task.value.query })
-        const items = await this.performSearch(task.value.query, task.value.timeoutMs, task.value.signal)
+        debug('worker_search_start', { worker: this.id, country: this.country, q: task.value.query })
+        const items = await this.performSearch(task.value.query, task.value.timeoutMs, task.value.signal, task.value.getAiAnswer)
         task.resolve(items)
       } catch (err) {
         task.reject(err)
       }
     }
   }
-  private async performSearch(query: string, timeoutMs: number, signal?: AbortSignal): Promise<SearchItem[]> {
+  private async performSearch(query: string, timeoutMs: number, signal: AbortSignal | undefined, getAiAnswer: boolean): Promise<SearchItem[]> {
     try {
-      const items = await searchOnce(this.browser, this.locale, this.acceptLanguage, query, timeoutMs, signal)
-      console.log('worker_search_ok', { worker: this.id, items: items.length })
+      const items = await searchOnce(this.browser, this.locale, this.acceptLanguage, query, timeoutMs, signal, getAiAnswer)
+      debug('worker_search_ok', { worker: this.id, items: items.length })
       return items
     } catch (err) {
       if ((err as any)?.message === 'aborted') throw err
-      console.error('worker_search_error_relaunch', { worker: this.id })
+      error('worker_search_error_relaunch', { worker: this.id })
       await this.relaunch()
       try {
-        const items = await searchOnce(this.browser, this.locale, this.acceptLanguage, query, timeoutMs, signal)
-        console.log('worker_search_ok_after_relaunch', { worker: this.id, items: items.length })
+        const items = await searchOnce(this.browser, this.locale, this.acceptLanguage, query, timeoutMs, signal, getAiAnswer)
+        debug('worker_search_ok_after_relaunch', { worker: this.id, items: items.length })
         return items
       } catch (e) {
         if ((e as any)?.message === 'aborted') throw e
-        console.error('worker_search_error_fail', { worker: this.id, error: (e as any)?.message || e })
+        error('worker_search_error_fail', { worker: this.id, error: (e as any)?.message || e })
         throw e
       }
     }
   }
   private async launch() {
     const options: Parameters<typeof chromium.launch>[0] = { headless: process.env.HEADLESS !== '0', devtools: true, args: chromeArgs(), proxy: getProxy(this.country) }
-    console.log('worker_launch', { worker: this.id, country: this.country })
+    debug('worker_launch', { worker: this.id, country: this.country })
     this.browser = await chromium.launch(options)
   }
   private async relaunch() {
     this.updateRegion()
-    console.log('worker_relaunch', { worker: this.id, country: this.country })
+    debug('worker_relaunch', { worker: this.id, country: this.country })
     await this.launch()
   }
 }
@@ -229,19 +231,19 @@ function startWorkers(n: number) {
   }
 }
 
-async function orchestrateSearch(query: string): Promise<SearchItem[]> {
+async function orchestrateSearch(query: string, getAiAnswer: boolean): Promise<SearchItem[]> {
   const TOTAL_MS = Number(36000)
   const ATTEMPT_MS = Math.max(1000, Math.floor(TOTAL_MS / 4))
   const attemptOne = (): Promise<SearchItem[]> => {
     const c = new AbortController()
-    const p = queue.enqueue({ query, timeoutMs: ATTEMPT_MS, signal: c.signal }) as Promise<SearchItem[]>
+    const p = queue.enqueue({ query, timeoutMs: ATTEMPT_MS, getAiAnswer, signal: c.signal }) as Promise<SearchItem[]>
     return p.finally(() => c.abort())
   }
   const attemptParallel = (): Promise<SearchItem[]> => {
     const c1 = new AbortController()
     const c2 = new AbortController()
-    const p1 = queue.enqueue({ query, timeoutMs: ATTEMPT_MS, signal: c1.signal }) as Promise<SearchItem[]>
-    const p2 = queue.enqueue({ query, timeoutMs: ATTEMPT_MS, signal: c2.signal }) as Promise<SearchItem[]>
+    const p1 = queue.enqueue({ query, timeoutMs: ATTEMPT_MS, getAiAnswer, signal: c1.signal }) as Promise<SearchItem[]>
+    const p2 = queue.enqueue({ query, timeoutMs: ATTEMPT_MS, getAiAnswer, signal: c2.signal }) as Promise<SearchItem[]>
     const raced = Promise.any<SearchItem[]>([p1, p2])
     raced.finally(() => { c1.abort(); c2.abort() })
     return raced
@@ -262,39 +264,41 @@ function startServer(port: number) {
         return
       }
       const q = (url.searchParams.get('q') || '').trim()
+      const getAiAnswerParam = url.searchParams.get('getAiAnswer')
+      const getAiAnswer = getAiAnswerParam == null ? true : !/^(0|false)$/i.test(getAiAnswerParam)
       if (!q) {
         res.statusCode = 400
         res.setHeader('Content-Type', 'application/json')
         res.end(JSON.stringify({ error: 'missing q' }))
         return
       }
-      console.log('request_received', { q })
+      debug('request_received', { q, getAiAnswer })
       try {
-        const result = await orchestrateSearch(q)
-        console.log('request_respond', { items: (result as any[])?.length })
+        const result = await orchestrateSearch(q, getAiAnswer)
+        debug('request_respond', { items: (result as any[])?.length })
         stats.success++
         if (process.env.DEBUG) {
-          try { await fs.promises.writeFile(process.env.LAST_FILE || 'last.json', JSON.stringify(result, null, '\t')) } catch (e) { console.error('last_write_error', (e as any)?.message || e) }
+          try { await fs.promises.writeFile(process.env.LAST_FILE || 'last.json', JSON.stringify(result, null, '\t')) } catch (e) { error('last_write_error', (e as any)?.message || e) }
         }
         res.statusCode = 200
         res.setHeader('Content-Type', 'application/json')
         res.end(JSON.stringify(result))
       } catch (e) {
         stats.failure++
-        console.error('request_error', { error: (e as any)?.stack || (e as any)?.message || e })
+        error('request_error', { error: (e as any)?.stack || (e as any)?.message || e })
         res.statusCode = 500
         res.setHeader('Content-Type', 'application/json')
         res.end(JSON.stringify({ error: 'internal' }))
       }
     } catch (e) {
-      console.error('request_error', { error: (e as any)?.stack || (e as any)?.message || e })
+      error('request_error', { error: (e as any)?.stack || (e as any)?.message || e })
       res.statusCode = 500
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ error: 'internal' }))
     }
   })
   server.listen(port)
-  console.log('server_listening', { port })
+  info('server_listening', { port })
 }
 
 const PORT = Number(process.env.PORT || 3000)
@@ -305,13 +309,13 @@ startServer(PORT)
 const stats = { success: 0, failure: 0 }
 const STATS_FILE = process.env.STATS_FILE || 'stats.json'
 setInterval(() => {
-  try { fs.writeFileSync(STATS_FILE, JSON.stringify(stats)) } catch (e) { console.error('stats_write_error', (e as any)?.message || e) }
+  try { fs.writeFileSync(STATS_FILE, JSON.stringify(stats)) } catch (e) { error('stats_write_error', (e as any)?.message || e) }
 }, 60_000)
 
 process.on('unhandledRejection', err => {
-  console.error('unhandledRejection', err)
+  error('unhandledRejection', err)
 })
 process.on('uncaughtException', err => {
-  console.error('uncaughtException', err)
+  error('uncaughtException', err)
 })
 
